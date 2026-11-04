@@ -25,15 +25,23 @@ ARQUITECTURA (capas independientes y reutilizables):
     2) Reglas      : R1 y R2 evaluan los datos; son las mismas en ambos modos.
     3) Exportacion : escribe resultado_detector.json y resultado_detector.csv.
 
+MENSAJES:
+    * Consola : mensajes cortos y legibles (una linea por regla).
+    * JSON    : cada resultado incluye ademas "detalle_tecnico" con el dato
+                evaluado y el error tecnico COMPLETO (p. ej. la excepcion CIM
+                de PowerShell sin recortar).
+    * CSV     : solo los 4 campos basicos (regla, estado, detalle, fecha).
+
 CODIGOS DE SALIDA:
     0 = ejecucion correcta (aunque haya ALERTA o NO_EVALUABLE; son hallazgos)
-    2 = error de uso o fixture ilegible (no se pudo ni empezar a evaluar)
+    2 = error de uso o fixture inexistente/ilegible (no se pudo evaluar)
 """
 
 import argparse
 import csv
 import json
 import platform
+import re
 import subprocess
 import sys
 from datetime import datetime
@@ -76,18 +84,53 @@ def a_booleano(valor):
     return None
 
 
-def dato(datos, error):
-    """Formato interno unico de un dato recolectado: {'datos': ..., 'error': ...}."""
-    return {"datos": datos, "error": error}
+def dato(datos, error, tecnico=None):
+    """
+    Formato interno unico de un dato recolectado:
+        datos   : valor normalizado (o None si no se pudo obtener)
+        error   : mensaje CORTO y amigable (se muestra en consola y en 'detalle')
+        tecnico : error tecnico COMPLETO (solo se guarda en el JSON)
+    """
+    return {"datos": datos, "error": error, "tecnico": tecnico if tecnico else error}
+
+
+def resumir_error(exc):
+    """
+    Convierte una excepcion (o texto) tecnica en un mensaje corto y entendible.
+    Los errores CIM/WMI de PowerShell ocupan decenas de lineas; aqui se
+    reconocen por palabras clave y se reemplazan por una frase clara. El texto
+    original NO se pierde: se guarda completo en 'detalle_tecnico' del JSON.
+    """
+    if isinstance(exc, subprocess.TimeoutExpired):
+        return "La consulta supero el tiempo maximo de espera"
+    if isinstance(exc, FileNotFoundError):
+        return "PowerShell no esta disponible en este equipo"
+    if isinstance(exc, json.JSONDecodeError):
+        return "La respuesta de PowerShell no se pudo interpretar"
+    texto = str(exc)
+    bajo = texto.lower()
+    if any(k in bajo for k in ("access is denied", "acceso denegado", "permissiondenied",
+                               "unauthorizedaccess", "privilegios")):
+        return "Acceso denegado: ejecute la consola como Administrador"
+    if any(k in bajo for k in ("cimexception", "cim ", "wmi", "invalid namespace",
+                               "espacio de nombres", "0x80041", "mi_result")):
+        return "Fallo de consulta CIM/WMI (servicio no disponible o sin permisos)"
+    if any(k in bajo for k in ("is not recognized", "no se reconoce", "commandnotfound")):
+        return "Comando de PowerShell no disponible en esta version de Windows"
+    primera = next((l.strip() for l in texto.splitlines() if l.strip()), "Error desconocido")
+    return primera if len(primera) <= 100 else primera[:97] + "..."
 
 
 def ejecutar_powershell(comando, tiempo_max=30):
     """
     Ejecuta UN comando PowerShell de solo lectura y devuelve su salida.
+    $ErrorActionPreference='Stop' hace que un error del cmdlet termine con
+    codigo distinto de cero (sin esto PowerShell podria devolver salida vacia).
     Lanza excepcion si falla; quien llama la convierte en NO_EVALUABLE.
     """
     resultado = subprocess.run(
-        ["powershell", "-NoProfile", "-NonInteractive", "-Command", comando],
+        ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+         "$ErrorActionPreference='Stop'; " + comando],
         capture_output=True, text=True, timeout=tiempo_max,
     )
     if resultado.returncode != 0:
@@ -116,7 +159,7 @@ def recolectar_firewall_real():
             return dato(None, "No se obtuvieron perfiles de firewall")
         return dato(perfiles, None)
     except Exception as exc:             # cualquier fallo => NO_EVALUABLE
-        return dato(None, f"{type(exc).__name__}: {exc}")
+        return dato(None, resumir_error(exc), f"{type(exc).__name__}: {exc}")
 
 
 def recolectar_smb1_real():
@@ -127,16 +170,17 @@ def recolectar_smb1_real():
     Metodo 2 (solo lectura): winreg con KEY_READ sobre
               HKLM\\SYSTEM\\CurrentControlSet\\Services\\LanmanServer\\Parameters\\SMB1
               (0 = deshabilitado, 1 = habilitado, ausente = no concluyente).
-    Nunca se escribe en el registro.
+    Nunca se escribe en el registro. Si ambos fallan, el mensaje corto resume el
+    problema y el texto completo de AMBOS intentos queda en el detalle tecnico.
     """
     try:
         valor = a_booleano(ejecutar_powershell(
             "(Get-SmbServerConfiguration).EnableSMB1Protocol"))
         if valor is not None:
             return dato(valor, None)
-        error_ps = "Valor no interpretable"
+        resumen_ps, tecnico_ps = "valor no interpretable", "Valor no interpretable"
     except Exception as exc:
-        error_ps = f"{type(exc).__name__}: {exc}"
+        resumen_ps, tecnico_ps = resumir_error(exc), f"{type(exc).__name__}: {exc}"
 
     try:
         import winreg                    # modulo exclusivo de Windows
@@ -146,12 +190,14 @@ def recolectar_smb1_real():
         valor = a_booleano(valor_reg)
         if valor is not None:
             return dato(valor, None)
-        return dato(None, f"Valor SMB1 del registro no interpretable: {valor_reg}")
+        return dato(None, "Valor SMB1 del registro no interpretable",
+                    f"[PowerShell] {tecnico_ps}\n[Registro] valor leido: {valor_reg!r}")
     except FileNotFoundError:
-        return dato(None, f"{error_ps}; el valor SMB1 no existe en el registro "
-                          "(se usa el valor por defecto de la version de Windows)")
+        return dato(None, f"{resumen_ps}; ademas SMB1 no figura en el registro (valor por defecto)",
+                    f"[PowerShell] {tecnico_ps}\n[Registro] el valor SMB1 no existe")
     except Exception as exc:
-        return dato(None, f"{error_ps}; registro: {type(exc).__name__}: {exc}")
+        return dato(None, f"{resumen_ps}; registro: {resumir_error(exc)}",
+                    f"[PowerShell] {tecnico_ps}\n[Registro] {type(exc).__name__}: {exc}")
 
 
 def recolectar_real():
@@ -166,13 +212,30 @@ def recolectar_real():
 # MODO FIXTURE: lee datos simulados desde un archivo JSON
 # --------------------------------------------------------------------------
 def localizar_fixture(nombre):
-    """Busca el fixture tal como se escribio o dentro de la carpeta fixtures/."""
+    """
+    Busca el fixture tal como se escribio o dentro de la carpeta fixtures/.
+    Si no existe lanza FixtureError con un mensaje claro (no un traceback).
+    """
     candidatos = [Path(nombre), DIR_FIXTURES / nombre]
     for ruta in candidatos:
         if ruta.is_file():
             return ruta
-    raise FixtureError(f"No se encontro el fixture '{nombre}' (se busco en: "
-                       + ", ".join(str(c) for c in candidatos) + ")")
+    if not DIR_FIXTURES.is_dir():
+        pista = f"La carpeta '{DIR_FIXTURES.name}/' no existe junto a detector.py."
+    else:
+        pista = f"Revise que '{nombre}' este dentro de '{DIR_FIXTURES.name}/'."
+    raise FixtureError(f"No se encontro el fixture '{nombre}'. {pista}")
+
+
+def fixtures_faltantes(nombres):
+    """Devuelve la lista de fixtures de 'nombres' que no existen (para validar antes de probar)."""
+    faltantes = []
+    for nombre in nombres:
+        try:
+            localizar_fixture(nombre)
+        except FixtureError:
+            faltantes.append(nombre)
+    return faltantes
 
 
 def recolectar_fixture(nombre):
@@ -191,9 +254,10 @@ def recolectar_fixture(nombre):
         with open(ruta, encoding="utf-8") as archivo:
             contenido = json.load(archivo)
     except json.JSONDecodeError as exc:
-        raise FixtureError(f"El fixture '{ruta.name}' no es JSON valido: {exc}") from exc
+        raise FixtureError(f"El fixture '{ruta.name}' no es JSON valido "
+                           f"(linea {exc.lineno}, columna {exc.colno})") from exc
     except OSError as exc:
-        raise FixtureError(f"No se pudo leer '{ruta}': {exc}") from exc
+        raise FixtureError(f"No se pudo leer el fixture '{ruta.name}'") from exc
     if not isinstance(contenido, dict):
         raise FixtureError(f"El fixture '{ruta.name}' debe contener un objeto JSON")
 
@@ -259,13 +323,27 @@ REGLAS = (("R1_FIREWALL", regla_r1_firewall, "firewall"),
 
 
 def evaluar(datos):
-    """Aplica R1 y R2. Una sola marca de tiempo ISO 8601 para toda la corrida."""
+    """
+    Aplica R1 y R2. Una sola marca de tiempo ISO 8601 para toda la corrida.
+    Cada resultado lleva:
+        detalle         : mensaje corto (consola, JSON y CSV)
+        detalle_tecnico : dato evaluado + error tecnico completo (solo JSON)
+    """
     marca = datetime.now().isoformat(timespec="seconds")
     resultados = []
     for nombre, regla, clave in REGLAS:
-        estado, detalle = regla(datos[clave])
-        resultados.append({"regla": nombre, "estado": estado, "detalle": detalle,
-                           "fecha_hora_ejecucion": marca})
+        entrada = datos[clave]
+        estado, detalle = regla(entrada)
+        resultados.append({
+            "regla": nombre,
+            "estado": estado,
+            "detalle": detalle,
+            "fecha_hora_ejecucion": marca,
+            "detalle_tecnico": {
+                "datos_evaluados": entrada["datos"],
+                "error_tecnico": entrada["tecnico"],
+            },
+        })
     return resultados
 
 
@@ -282,7 +360,7 @@ def exportar(resultados, carpeta=DIR_RESULTADOS):
         json.dump(resultados, f, ensure_ascii=False, indent=2)
     # utf-8-sig: Excel reconoce los acentos al abrir el CSV
     with open(ruta_csv, "w", encoding="utf-8-sig", newline="") as f:
-        escritor = csv.DictWriter(f, fieldnames=CAMPOS)
+        escritor = csv.DictWriter(f, fieldnames=CAMPOS, extrasaction="ignore")  # sin detalle_tecnico
         escritor.writeheader()
         escritor.writerows(resultados)
     return ruta_json, ruta_csv
@@ -306,12 +384,18 @@ def analizar_argumentos(argv):
     return args
 
 
+def linea_corta(texto, maximo=110):
+    """Una sola linea, recortada, para que la consola sea legible."""
+    texto = " ".join(str(texto).split())
+    return texto if len(texto) <= maximo else texto[:maximo - 3] + "..."
+
+
 def main(argv=None):
     args = analizar_argumentos(argv)
     try:
         datos = recolectar_real() if args.modo == "REAL" else recolectar_fixture(args.fixture)
     except FixtureError as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
+        print(f"ERROR de fixture: {exc}", file=sys.stderr)
         return 2
     resultados = evaluar(datos)
     ruta_json, ruta_csv = exportar(resultados)
@@ -319,8 +403,11 @@ def main(argv=None):
     origen = args.modo + (f" ({args.fixture})" if args.fixture else "")
     print(f"Modo de ejecucion: {origen}")
     for r in resultados:
-        print(f"  [{r['estado']:<12}] {r['regla']}: {r['detalle']}")
-    print(f"Resultados exportados a:\n  {ruta_json}\n  {ruta_csv}")
+        print(f"  [{r['estado']:<12}] {r['regla']}: {linea_corta(r['detalle'])}")
+    if any(r["estado"] == NO_EVALUABLE for r in resultados):
+        print("  (El detalle tecnico completo esta en el JSON, campo 'detalle_tecnico')")
+    print(f"Resultados exportados a: {ruta_json.parent}")
+    print(f"  - {ruta_json.name}\n  - {ruta_csv.name}")
     return 0
 
 
